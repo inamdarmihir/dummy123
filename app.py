@@ -38,8 +38,19 @@ MARKET_LIST = [
 
 # Nokia Cell Name Pattern Regex - for validation
 # Format: 1 letter prefix + 8 char SITEID + 2 digit sector = 11 chars total
-NOKIA_CELL_PATTERN = re.compile(r'^[A-Z][A-Z0-9]{7}[A-Z][0-9]{2}$')
+# Valid example: B9BH0003A21 where B=prefix, 9BH0003A=SITEID, 21=sector
+NOKIA_CELL_PATTERN = re.compile(r'^[A-Z][A-Z0-9]{8}[0-9]{2}$')
 NOKIA_SITEID_PATTERN = re.compile(r'^[A-Z0-9]{8}$')
+
+# Patterns that indicate FAKE/hallucinated cell IDs (city/airport codes)
+FAKE_CELL_PATTERNS = [
+    # 3-letter city/airport codes followed by numbers (ATL00123A11, CHI04567B21)
+    re.compile(r'^[A-Z]{3}\d{5}[A-Z]\d{2}$', re.IGNORECASE),
+    # Common US city/airport codes at start
+    re.compile(r'^(ATL|CHI|DAL|DET|HOU|IND|MIA|PHX|SEA|TAM|NYC|LAX|SFO|DEN|BOS|MSP|DTW|ORD|DFW|IAH|EWR|JFK|LGA|PHL|CLT|MCO|TPA|FLL|RSW|JAX|BNA|MEM|STL|MCI|OMA|OKC|AUS|SAT|ABQ|SLC|PDX|SAN|SMF|OAK|SJC|LAS|RNO|BOI|GEG|ANC|HNL)', re.IGNORECASE),
+    # Market name abbreviations (ATLANTA -> ATL pattern)
+    re.compile(r'^(ATLANTA|CHICAGO|DALLAS|DETROIT|HOUSTON|INDIANAPOLIS|MIAMI|PHOENIX|SEATTLE|TAMPA|DENVER|BOSTON|AUSTIN|ORLANDO|MEMPHIS|NASHVILLE|PORTLAND|CLEVELAND|COLUMBUS|PITTSBURGH|MILWAUKEE|MINNEAPOLIS|JACKSONVILLE|BIRMINGHAM|LOUISVILLE|KNOXVILLE|MOBILE|MONTANA|OMAHA|SPOKANE)', re.IGNORECASE),
+]
 
 
 # Pydantic models for structured output
@@ -193,6 +204,13 @@ def extract_site_from_cell(cell_name: str) -> tuple:
 def detect_hallucinated_cells(cells_data: list) -> tuple:
     """
     Detect potentially hallucinated/fabricated cell IDs.
+    
+    Fake cell IDs typically follow patterns like:
+    - ATL00123A11 (city code + sequential numbers)
+    - CHI04567B21 (airport code pattern)
+    
+    Real Nokia cell IDs follow pattern like:
+    - B9BH0003A21 (prefix + alphanumeric SITEID + sector digits)
 
     Returns: (valid_cells, warning_message)
     """
@@ -200,45 +218,79 @@ def detect_hallucinated_cells(cells_data: list) -> tuple:
         return ([], None)
 
     valid_cells = []
-    suspicious_count = 0
-
-    # Known fake patterns (generic patterns that don't match real Nokia cells)
-    fake_patterns = [
-        r'^[A-Z]{3}\d{5}[A-Z]\d{2}$',  # Pattern like ATL00123A11 (market code + numbers)
-        r'^(ATL|CHI|DAL|DET|HOU|IND|MIA|PHX|SEA|TAM|NYC|LAX|SFO)\d+',  # Airport/city codes
-    ]
+    suspicious_cells = []
 
     for cell in cells_data:
         cell_name = cell.get('cell_name', '') or cell.get('cell_id', '') or cell.get('name', '')
-
+        cell_name_upper = cell_name.upper().strip()
+        
         is_suspicious = False
+        reason = ""
 
-        # Check against fake patterns
-        for pattern in fake_patterns:
-            if re.match(pattern, cell_name, re.IGNORECASE):
+        # Check against known fake patterns FIRST
+        for fake_pattern in FAKE_CELL_PATTERNS:
+            if fake_pattern.match(cell_name_upper):
                 is_suspicious = True
+                reason = "matches city/airport code pattern"
                 break
+        
+        # Additional heuristic checks for fake cells
+        if not is_suspicious:
+            # Check for sequential digit patterns (00123, 04567, etc.) - common in hallucinated IDs
+            sequential_digits = re.search(r'\d{5,}', cell_name_upper)
+            if sequential_digits:
+                digits = sequential_digits.group()
+                # Check if digits are mostly sequential or repetitive
+                if len(set(digits)) <= 2:  # Very repetitive like 00000 or 00011
+                    is_suspicious = True
+                    reason = "contains repetitive digit sequence"
+            
+            # Check for market name embedded in cell ID
+            for market in MARKET_LIST:
+                market_abbrev = market[:3].upper()
+                if cell_name_upper.startswith(market_abbrev) and len(cell_name_upper) >= 10:
+                    # Check if it's followed by mostly digits (hallucination pattern)
+                    rest = cell_name_upper[3:]
+                    digit_count = sum(1 for c in rest if c.isdigit())
+                    if digit_count >= len(rest) * 0.6:  # More than 60% digits after city code
+                        is_suspicious = True
+                        reason = f"starts with market abbreviation '{market_abbrev}'"
+                        break
 
-        # Check if it looks like a real Nokia cell
-        if not is_suspicious and len(cell_name) >= 10:
-            # Real Nokia cells typically have alphanumeric mix in specific positions
-            if validate_nokia_cell_name(cell_name):
-                valid_cells.append(cell)
+        # Validate against Nokia pattern if not already suspicious
+        if not is_suspicious:
+            if len(cell_name_upper) >= 10 and len(cell_name_upper) <= 12:
+                if validate_nokia_cell_name(cell_name_upper):
+                    # Additional check: first char after prefix should not be all same digits
+                    if len(cell_name_upper) == 11:
+                        siteid_part = cell_name_upper[1:9]  # SITEID portion
+                        # Real SITEIDs have mixed alphanumeric, not just digits
+                        if not siteid_part.isdigit():
+                            valid_cells.append(cell)
+                        else:
+                            is_suspicious = True
+                            reason = "SITEID portion is all digits (unusual)"
+                    else:
+                        valid_cells.append(cell)
+                else:
+                    is_suspicious = True
+                    reason = "does not match Nokia cell naming convention"
             else:
                 is_suspicious = True
-        else:
-            is_suspicious = True
+                reason = f"invalid length ({len(cell_name_upper)} chars, expected 10-12)"
 
         if is_suspicious:
-            suspicious_count += 1
-            logger.warning(f"Potentially fabricated cell ID detected: {cell_name}")
+            suspicious_cells.append({'cell_name': cell_name, 'reason': reason})
+            logger.warning(f"Potentially fabricated cell ID detected: {cell_name} - {reason}")
 
     warning = None
+    suspicious_count = len(suspicious_cells)
+    
     if suspicious_count > 0:
         if suspicious_count == len(cells_data):
-            warning = f"⚠️ WARNING: All {suspicious_count} cell IDs appear to be fabricated/hallucinated. No matching cell data found in the database. Please verify your data source contains actual cell performance records."
+            warning = f"⚠️ WARNING: All {suspicious_count} cell IDs appear to be fabricated/hallucinated (e.g., '{suspicious_cells[0]['cell_name']}' - {suspicious_cells[0]['reason']}). No matching cell data found in the database. Real Nokia cell IDs follow format like 'B9BH0003A21'. Please verify your data source contains actual cell performance records."
         else:
-            warning = f"⚠️ WARNING: {suspicious_count} of {len(cells_data)} cell IDs may be fabricated. Results may be inaccurate."
+            warning = f"⚠️ WARNING: {suspicious_count} of {len(cells_data)} cell IDs may be fabricated. Only {len(valid_cells)} valid cells will be shown."
 
     return (valid_cells, warning)
 
@@ -761,21 +813,26 @@ RULES:
             data_found = json_data.get('data_found', len(cell_performance) > 0)
 
             if cell_performance:
-                # Validate extracted cells
+                # Validate extracted cells - CRITICAL: filters out hallucinated/fake cell IDs
                 valid_cells, warning = detect_hallucinated_cells(cell_performance)
                 data_quality_warning = warning
+                
+                logger.info(f"Cell validation: {len(cell_performance)} input, {len(valid_cells)} valid, {len(cell_performance) - len(valid_cells)} rejected")
 
-                if warning and "All" in warning:
+                if not valid_cells:
                     # All cells are fabricated - don't show the table
-                    logger.warning("All extracted cells appear to be fabricated")
+                    logger.warning("All extracted cells appear to be fabricated - no valid Nokia cell IDs found")
                     cell_performance = []
                 else:
-                    # Process valid cells - derive SITEID correctly
+                    # Process ONLY valid cells - derive SITEID correctly using Nokia naming convention
                     processed_cells = []
-                    for cell in cell_performance:
+                    for cell in valid_cells:  # FIXED: Use valid_cells, not cell_performance
                         cell_name = cell.get('cell_name', '')
 
-                        # Derive SITEID and Sector Name correctly
+                        # Derive SITEID and Sector Name correctly per Nokia convention
+                        # cellName (11 chars): B9BH0003A21
+                        # Sector Name (10 chars): 9BH0003A21 (chars 2-11)
+                        # SITEID (8 chars): 9BH0003A (first 8 of Sector Name)
                         site_id, sector_name = extract_site_from_cell(cell_name)
 
                         processed_cells.append({
@@ -794,6 +851,7 @@ RULES:
                         })
 
                     cell_performance = processed_cells
+                    logger.info(f"Processed {len(cell_performance)} valid cells for display")
 
             # Create cell performance table
             if cell_performance:
